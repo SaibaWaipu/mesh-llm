@@ -1277,8 +1277,10 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     fn sleeping_test_command() -> Command {
-        let mut command = Command::new("sh");
-        command.args(["-c", "sleep 60"]);
+        // Spawn `sleep` itself, not through `sh -c`: `kill_on_drop` only kills
+        // the direct child, so a shell wrapper would leave `sleep` orphaned.
+        let mut command = Command::new("sleep");
+        command.arg("60");
         command
     }
 
