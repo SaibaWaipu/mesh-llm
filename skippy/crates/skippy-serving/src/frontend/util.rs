@@ -64,6 +64,8 @@ pub(super) struct Utf8Prefix {
 }
 
 pub(super) fn utf8_prefix(bytes: &[u8]) -> Utf8Prefix {
+    #[cfg(test)]
+    UTF8_BYTES_SCANNED.with(|cell| cell.set(cell.get() + bytes.len()));
     match std::str::from_utf8(bytes) {
         Ok(_) => Utf8Prefix {
             valid_len: bytes.len(),
@@ -74,6 +76,21 @@ pub(super) fn utf8_prefix(bytes: &[u8]) -> Utf8Prefix {
             hard_error: error.error_len().is_some(),
         },
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static UTF8_BYTES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(super) fn reset_utf8_bytes_scanned() {
+    UTF8_BYTES_SCANNED.with(|cell| cell.set(0));
+}
+
+#[cfg(test)]
+pub(super) fn utf8_bytes_scanned() -> usize {
+    UTF8_BYTES_SCANNED.with(|cell| cell.get())
 }
 
 pub(super) fn saturating_u32(value: usize) -> u32 {

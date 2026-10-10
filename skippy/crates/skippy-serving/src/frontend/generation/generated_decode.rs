@@ -13,8 +13,6 @@ pub(super) struct GeneratedUtf8 {
     /// A hard UTF-8 error already closed the valid prefix. Later bytes cannot
     /// extend it, matching `str::from_utf8` stopping at the first error.
     closed: bool,
-    #[cfg(test)]
-    bytes_examined: usize,
 }
 
 pub(super) struct OpenText {
@@ -27,6 +25,8 @@ pub(super) struct OpenText {
     /// means a stop trim (or another rewrite) and takes the old divergence path.
     synced_len: usize,
     decoder: GeneratedUtf8,
+    #[cfg(test)]
+    bytes_copied: usize,
 }
 
 pub(super) enum EmitPlan {
@@ -41,8 +41,6 @@ impl GeneratedUtf8 {
             pending: Vec::new(),
             decoded: String::new(),
             closed: false,
-            #[cfg(test)]
-            bytes_examined: 0,
         }
     }
 
@@ -51,10 +49,6 @@ impl GeneratedUtf8 {
             return;
         }
         self.pending.extend_from_slice(piece);
-        #[cfg(test)]
-        {
-            self.bytes_examined += self.pending.len();
-        }
         let prefix = crate::frontend::util::utf8_prefix(&self.pending);
         let valid_len = prefix.valid_len;
         let hard_error = prefix.hard_error;
@@ -73,11 +67,6 @@ impl GeneratedUtf8 {
     fn decoded(&self) -> &str {
         &self.decoded
     }
-
-    #[cfg(test)]
-    fn bytes_examined(&self) -> usize {
-        self.bytes_examined
-    }
 }
 
 impl OpenText {
@@ -89,6 +78,8 @@ impl OpenText {
             stop_searched_len: 0,
             synced_len: 0,
             decoder: GeneratedUtf8::new(),
+            #[cfg(test)]
+            bytes_copied: 0,
         }
     }
 
@@ -156,7 +147,9 @@ impl OpenText {
             return;
         }
         if self.text != self.decoder.decoded() {
-            self.text = self.decoder.decoded().to_owned();
+            let replacement = self.decoder.decoded().to_owned();
+            self.note_copy(replacement.len());
+            self.text = replacement;
             self.stop_searched_len = 0;
             self.synced_len = self.text.len();
         }
@@ -167,8 +160,25 @@ impl OpenText {
             return;
         }
         let suffix = self.decoder.decoded()[start..end].to_owned();
+        self.note_copy(suffix.len());
         self.text.push_str(&suffix);
         self.synced_len = self.text.len();
+    }
+
+    fn note_copy(&mut self, bytes: usize) {
+        #[cfg(test)]
+        {
+            self.bytes_copied += bytes;
+        }
+        #[cfg(not(test))]
+        {
+            let _ = bytes;
+        }
+    }
+
+    #[cfg(test)]
+    fn bytes_copied(&self) -> usize {
+        self.bytes_copied
     }
 }
 
@@ -228,20 +238,25 @@ mod tests {
         }
 
         fn take_delta(&mut self, flush_all: bool) -> Option<String> {
-            let mut open = OpenText::new(self.max_stop_bytes);
-            open.text = self.text.clone();
-            open.streamed_text_len = self.streamed_text_len;
-            open.max_stop_bytes = self.max_stop_bytes;
-            match open.plan_emit(flush_all) {
-                EmitPlan::Delta { start, end } => {
-                    self.streamed_text_len = end;
-                    Some(self.text[start..end].to_string())
-                }
-                EmitPlan::Shrink(len) => {
-                    self.streamed_text_len = len;
-                    None
-                }
-                EmitPlan::Idle => None,
+            let mut target_len = if flush_all || self.max_stop_bytes == 0 {
+                self.text.len()
+            } else {
+                self.text
+                    .len()
+                    .saturating_sub(self.max_stop_bytes.saturating_sub(1))
+            };
+            while target_len > self.streamed_text_len && !self.text.is_char_boundary(target_len) {
+                target_len -= 1;
+            }
+            if target_len < self.streamed_text_len {
+                self.streamed_text_len = target_len;
+                None
+            } else if target_len > self.streamed_text_len {
+                let delta = self.text[self.streamed_text_len..target_len].to_string();
+                self.streamed_text_len = target_len;
+                Some(delta)
+            } else {
+                None
             }
         }
     }
@@ -313,24 +328,35 @@ mod tests {
 
     #[test]
     fn long_stream_examines_bytes_proportional_to_the_new_piece() {
+        use crate::frontend::util::{reset_utf8_bytes_scanned, utf8_bytes_scanned};
+
+        reset_utf8_bytes_scanned();
         let mut open = OpenText::new(0);
         let tokens = 4_096;
         for _ in 0..tokens {
             open.push_piece(b"a", &[]);
         }
         assert_eq!(open.text().len(), tokens);
-        let examined = open.decoder.bytes_examined();
+        let scanned = utf8_bytes_scanned();
         assert!(
-            examined <= tokens * 4,
-            "examined {examined} bytes for {tokens} new bytes"
+            scanned <= tokens * 4,
+            "scanned {scanned} bytes for {tokens} new bytes"
         );
+        assert_eq!(open.bytes_copied(), tokens);
     }
 
     #[test]
     fn stop_that_spans_tokens_trims_and_flush_releases_the_holdback() {
         let (text, emitted) = drive(&[b"hello ST", b"OP tail"], &["STOP"], "STOP".len());
         assert_eq!(text, "hello ");
-        assert_eq!(emitted.concat(), "hello ");
+        assert_eq!(emitted, vec!["hello".to_string(), " ".to_string()]);
+    }
+
+    #[test]
+    fn final_flush_releases_bytes_held_for_a_stop_sequence() {
+        let (text, emitted) = drive(&[b"abcdef"], &[], 4);
+        assert_eq!(text, "abcdef");
+        assert_eq!(emitted, vec!["abc".to_string(), "def".to_string()]);
     }
 
     #[test]
