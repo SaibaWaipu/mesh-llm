@@ -18,7 +18,9 @@ bootstrap-build-tools:
 with-lld *COMMAND:
     #!/usr/bin/env bash
     set -euo pipefail
-    command -v sccache >/dev/null 2>&1 || {
+    # An explicitly set RUSTC_WRAPPER, including the documented empty bypass,
+    # replaces the sccache wrapper from .cargo/config.toml.
+    [[ -n "${RUSTC_WRAPPER+set}" ]] || command -v sccache >/dev/null 2>&1 || {
         echo "Error: sccache is required; install it and retry." >&2
         exit 1
     }
