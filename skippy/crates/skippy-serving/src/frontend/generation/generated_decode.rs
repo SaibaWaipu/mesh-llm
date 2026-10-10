@@ -276,9 +276,6 @@ mod tests {
             if let Some(delta) = delta {
                 emitted.push(delta);
             }
-            if stopped {
-                break;
-            }
         }
         if !pieces.is_empty() {
             let delta = take_delta(&mut open, true);
@@ -321,6 +318,21 @@ mod tests {
     }
 
     #[test]
+    fn split_multibyte_rescans_only_the_incomplete_tail() {
+        use crate::frontend::util::{reset_utf8_bytes_scanned, utf8_bytes_scanned};
+
+        reset_utf8_bytes_scanned();
+        let euro = "€".as_bytes();
+        let pieces: Vec<Vec<u8>> = euro.iter().copied().map(|byte| vec![byte]).collect();
+        let refs: Vec<&[u8]> = pieces.iter().map(Vec::as_slice).collect();
+        let (text, _) = drive(&refs, &[], 0);
+        assert_eq!(text, "€");
+        // 1 + 2 + 3: each new byte is scanned with the still-incomplete tail,
+        // not with the bytes already committed.
+        assert_eq!(utf8_bytes_scanned(), 6);
+    }
+
+    #[test]
     fn invalid_utf8_does_not_decode_bytes_after_the_error() {
         let (text, _) = drive(&[b"hi", &[0xff], b"there"], &[], 0);
         assert_eq!(text, "hi");
@@ -338,10 +350,7 @@ mod tests {
         }
         assert_eq!(open.text().len(), tokens);
         let scanned = utf8_bytes_scanned();
-        assert!(
-            scanned <= tokens * 4,
-            "scanned {scanned} bytes for {tokens} new bytes"
-        );
+        assert_eq!(scanned, tokens);
         assert_eq!(open.bytes_copied(), tokens);
     }
 
@@ -364,6 +373,59 @@ mod tests {
         let (text, emitted) = drive(&[&[b'A', 0xE2, 0x82]], &[], 0);
         assert_eq!(text, "A");
         assert_eq!(emitted.concat(), "A");
+    }
+
+    #[test]
+    fn holdback_walks_back_to_a_char_boundary() {
+        let (text, emitted) = drive(&["aéé".as_bytes()], &[], 3);
+        assert_eq!(text, "aéé");
+        assert_eq!(emitted, vec!["aé".to_string(), "é".to_string()]);
+    }
+
+    #[test]
+    fn incomplete_sequence_that_becomes_invalid_drops_the_following_bytes() {
+        let (text, emitted) = drive(&[&[0xE2], &[0xFF], b"Z"], &[], 0);
+        assert_eq!(text, "");
+        assert!(emitted.is_empty());
+    }
+
+    #[test]
+    fn earliest_stop_wins_when_the_match_spans_tokens() {
+        let (text, emitted) = drive(&[b"xxB", b"Ayy"], &["BA", "Ayy"], 3);
+        assert_eq!(text, "xx");
+        assert_eq!(emitted, vec!["x".to_string(), "x".to_string()]);
+    }
+
+    #[test]
+    fn bytes_after_a_stop_follow_the_previous_prefix_rules() {
+        let (text, emitted) = drive(&[b"hello ST", b"OP", b"X"], &["STOP"], "STOP".len());
+        assert_eq!(text, "hello STOPX");
+        assert_eq!(
+            emitted,
+            vec![
+                "hello".to_string(),
+                " ".to_string(),
+                "ST".to_string(),
+                "OPX".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn chunked_mixed_bytes_match_the_previous_decoder() {
+        let mut raw = b"pr".to_vec();
+        raw.extend_from_slice("€".as_bytes());
+        raw.extend_from_slice(b" END tail");
+        raw.push(0xff);
+        raw.extend_from_slice(b"NO");
+        for width in [1_usize, 2, 3, 5] {
+            let pieces: Vec<Vec<u8>> = raw.chunks(width).map(<[u8]>::to_vec).collect();
+            let refs: Vec<&[u8]> = pieces.iter().map(Vec::as_slice).collect();
+            let (text, emitted) = drive(&refs, &["END"], "END".len());
+            assert_eq!(text, "pr€ END tail", "width {width}");
+            assert_eq!(emitted.concat(), text, "width {width}");
+            assert!(!text.contains("NO"), "width {width}");
+        }
     }
 
     #[test]
