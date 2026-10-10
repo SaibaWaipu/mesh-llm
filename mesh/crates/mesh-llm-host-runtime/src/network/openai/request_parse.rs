@@ -493,6 +493,7 @@ where
         Some(&rewrite.request_path),
         rewrite.rewritten_body.as_deref(),
         parsed.request_id,
+        limits.max_header_bytes,
     )
     .map_err(|error| OpenAiRequestReadError::after_headers(error, &parsed))?;
     let body_len_bytes = body.len();
@@ -563,7 +564,24 @@ where
     let mut sent_continue = false;
     let mut decoder = ChunkedDecoder::new(body_limits.max_body_bytes);
     loop {
-        if let Some(consumed) = decoder.decode(&raw[header_end..])? {
+        let decision = {
+            let wire = &raw[header_end..];
+            match decoder.decode(wire)? {
+                Some(consumed) => Some(consumed),
+                None => {
+                    // An unfinished message already past the budget cannot become
+                    // legal. Bytes past a completed message are lookahead and are
+                    // judged by `consumed`, not by the size of this read.
+                    ensure_chunked_wire_within_limit(
+                        wire.len(),
+                        body_limits.max_chunked_wire_bytes,
+                    )?;
+                    None
+                }
+            }
+        };
+        if let Some(consumed) = decision {
+            ensure_chunked_wire_within_limit(consumed, body_limits.max_chunked_wire_bytes)?;
             raw.truncate(header_end + consumed);
             return Ok(decoder.into_body());
         }
@@ -572,12 +590,6 @@ where
             sent_continue = true;
         }
         read_body_more(stream, raw, deadline.at(raw.len() - header_end)).await?;
-        if raw.len().saturating_sub(header_end) > body_limits.max_chunked_wire_bytes {
-            bail!(
-                "HTTP chunked wire body exceeds {} bytes",
-                body_limits.max_chunked_wire_bytes
-            );
-        }
     }
 }
 
@@ -692,6 +704,7 @@ fn finalize_forwarded_request(
     rewritten_path: Option<&str>,
     rewritten_body: Option<&[u8]>,
     request_id: RequestId,
+    max_header_bytes: usize,
 ) -> Result<Vec<u8>> {
     let original_body = raw.split_off(header_end);
     // Re-parse with httparse so we iterate over validated header structs.
@@ -768,6 +781,9 @@ fn finalize_forwarded_request(
     // The proxy buffers exactly one request for routing, so force a single-request
     // connection contract upstream instead of reusing the client connection blindly.
     rebuilt.push_str("Connection: close\r\n\r\n");
+    if rebuilt.len() > max_header_bytes {
+        bail!("HTTP headers exceed {max_header_bytes} bytes");
+    }
 
     let mut forwarded = rebuilt.into_bytes();
     forwarded.extend_from_slice(rewritten_body.unwrap_or(&original_body));
@@ -790,6 +806,9 @@ where
         let mut req = httparse::Request::new(&mut headers_buf);
         match req.parse(buf) {
             Ok(httparse::Status::Complete(header_end)) => {
+                if header_end > max_header_bytes {
+                    bail!("HTTP headers exceed {max_header_bytes} bytes");
+                }
                 let method = req.method.unwrap_or("GET").to_string();
                 let path = req.path.unwrap_or("/").to_string();
 
@@ -1170,6 +1189,17 @@ pub(crate) fn internal_model_for_public_id(
     })
 }
 
+fn ensure_chunked_wire_within_limit(wire_bytes: usize, limit: usize) -> Result<()> {
+    if wire_bytes > limit {
+        bail!("HTTP chunked wire body exceeds {limit} bytes");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 #[path = "request_parse_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "request_parse/read_budget_tests.rs"]
+mod read_budget_tests;

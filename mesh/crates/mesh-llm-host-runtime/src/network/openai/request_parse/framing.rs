@@ -246,6 +246,7 @@ mod tests {
             None,
             rewritten_body,
             mesh_llm_events::logging::identifiers::RequestId::new(),
+            super::super::MAX_HEADER_BYTES,
         )
     }
 
