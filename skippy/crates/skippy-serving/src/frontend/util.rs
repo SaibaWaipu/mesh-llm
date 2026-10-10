@@ -56,10 +56,23 @@ pub(super) fn generation_stop_values(
     values
 }
 
-pub(super) fn valid_utf8_prefix_len(bytes: &[u8]) -> usize {
+pub(super) struct Utf8Prefix {
+    pub(super) valid_len: usize,
+    /// `true` when the first error is an invalid sequence, not an incomplete
+    /// character at the end of `bytes`.
+    pub(super) hard_error: bool,
+}
+
+pub(super) fn utf8_prefix(bytes: &[u8]) -> Utf8Prefix {
     match std::str::from_utf8(bytes) {
-        Ok(_) => bytes.len(),
-        Err(error) => error.valid_up_to(),
+        Ok(_) => Utf8Prefix {
+            valid_len: bytes.len(),
+            hard_error: false,
+        },
+        Err(error) => Utf8Prefix {
+            valid_len: error.valid_up_to(),
+            hard_error: error.error_len().is_some(),
+        },
     }
 }
 

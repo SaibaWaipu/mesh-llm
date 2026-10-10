@@ -1,0 +1,354 @@
+//! Incremental UTF-8 assembly for generated tokens.
+//!
+//! Each token used to rescan and copy the whole decoded prefix. This keeps the
+//! uncommitted byte tail, appends only the newly valid suffix, and leaves stop
+//! search, invalid UTF-8, and the safe streaming holdback on their old rules.
+
+use crate::frontend::stop_sequences::stop_in_new_text;
+use crate::frontend::util::trim_at_stop;
+
+pub(super) struct GeneratedUtf8 {
+    pending: Vec<u8>,
+    decoded: String,
+    /// A hard UTF-8 error already closed the valid prefix. Later bytes cannot
+    /// extend it, matching `str::from_utf8` stopping at the first error.
+    closed: bool,
+    #[cfg(test)]
+    bytes_examined: usize,
+}
+
+pub(super) struct OpenText {
+    text: String,
+    streamed_text_len: usize,
+    max_stop_bytes: usize,
+    /// Length of `text` already searched for stop sequences.
+    stop_searched_len: usize,
+    /// `text.len()` last time `text` was the decoded prefix. A shorter `text`
+    /// means a stop trim (or another rewrite) and takes the old divergence path.
+    synced_len: usize,
+    decoder: GeneratedUtf8,
+}
+
+pub(super) enum EmitPlan {
+    Idle,
+    Shrink(usize),
+    Delta { start: usize, end: usize },
+}
+
+impl GeneratedUtf8 {
+    fn new() -> Self {
+        Self {
+            pending: Vec::new(),
+            decoded: String::new(),
+            closed: false,
+            #[cfg(test)]
+            bytes_examined: 0,
+        }
+    }
+
+    fn push(&mut self, piece: &[u8]) {
+        if piece.is_empty() || self.closed {
+            return;
+        }
+        self.pending.extend_from_slice(piece);
+        #[cfg(test)]
+        {
+            self.bytes_examined += self.pending.len();
+        }
+        let prefix = crate::frontend::util::utf8_prefix(&self.pending);
+        let valid_len = prefix.valid_len;
+        let hard_error = prefix.hard_error;
+        if valid_len > 0
+            && let Ok(valid) = std::str::from_utf8(&self.pending[..valid_len])
+        {
+            self.decoded.push_str(valid);
+            self.pending.drain(..valid_len);
+        }
+        if hard_error {
+            self.closed = true;
+            self.pending.clear();
+        }
+    }
+
+    fn decoded(&self) -> &str {
+        &self.decoded
+    }
+
+    #[cfg(test)]
+    fn bytes_examined(&self) -> usize {
+        self.bytes_examined
+    }
+}
+
+impl OpenText {
+    pub(super) fn new(max_stop_bytes: usize) -> Self {
+        Self {
+            text: String::new(),
+            streamed_text_len: 0,
+            max_stop_bytes,
+            stop_searched_len: 0,
+            synced_len: 0,
+            decoder: GeneratedUtf8::new(),
+        }
+    }
+
+    pub(super) fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub(super) fn into_text(self) -> String {
+        self.text
+    }
+
+    pub(super) fn push_piece(&mut self, piece: &[u8], stop_values: &[&str]) -> bool {
+        self.sync_decoded(piece);
+        let stop_found = stop_in_new_text(
+            &self.text,
+            self.stop_searched_len,
+            stop_values,
+            self.max_stop_bytes,
+        );
+        self.stop_searched_len = self.text.len();
+        if stop_found {
+            let end = trim_at_stop(&self.text, stop_values).len();
+            self.text.truncate(end);
+        }
+        stop_found
+    }
+
+    pub(super) fn plan_emit(&self, flush_all: bool) -> EmitPlan {
+        let mut target_len = if flush_all || self.max_stop_bytes == 0 {
+            self.text.len()
+        } else {
+            self.text
+                .len()
+                .saturating_sub(self.max_stop_bytes.saturating_sub(1))
+        };
+        while target_len > self.streamed_text_len && !self.text.is_char_boundary(target_len) {
+            target_len -= 1;
+        }
+        if target_len < self.streamed_text_len {
+            EmitPlan::Shrink(target_len)
+        } else if target_len > self.streamed_text_len {
+            EmitPlan::Delta {
+                start: self.streamed_text_len,
+                end: target_len,
+            }
+        } else {
+            EmitPlan::Idle
+        }
+    }
+
+    pub(super) fn commit_streamed(&mut self, len: usize) {
+        self.streamed_text_len = len;
+    }
+
+    fn sync_decoded(&mut self, piece: &[u8]) {
+        let before = self.decoder.decoded().len();
+        self.decoder.push(piece);
+        let decoded_len = self.decoder.decoded().len();
+        if self.synced_len == self.text.len() && before == self.text.len() {
+            self.append_decoded_suffix(before, decoded_len);
+            return;
+        }
+        if self.decoder.decoded().starts_with(&self.text) {
+            self.append_decoded_suffix(self.text.len(), decoded_len);
+            return;
+        }
+        if self.text != self.decoder.decoded() {
+            self.text = self.decoder.decoded().to_owned();
+            self.stop_searched_len = 0;
+            self.synced_len = self.text.len();
+        }
+    }
+
+    fn append_decoded_suffix(&mut self, start: usize, end: usize) {
+        if end <= start {
+            return;
+        }
+        let suffix = self.decoder.decoded()[start..end].to_owned();
+        self.text.push_str(&suffix);
+        self.synced_len = self.text.len();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Reference {
+        bytes: Vec<u8>,
+        text: String,
+        stop_searched_len: usize,
+        streamed_text_len: usize,
+        max_stop_bytes: usize,
+    }
+
+    impl Reference {
+        fn new(max_stop_bytes: usize) -> Self {
+            Self {
+                bytes: Vec::new(),
+                text: String::new(),
+                stop_searched_len: 0,
+                streamed_text_len: 0,
+                max_stop_bytes,
+            }
+        }
+
+        fn push_piece(&mut self, piece: &[u8], stop_values: &[&str]) -> bool {
+            self.bytes.extend_from_slice(piece);
+            let valid_len = match std::str::from_utf8(&self.bytes) {
+                Ok(_) => self.bytes.len(),
+                Err(error) => error.valid_up_to(),
+            };
+            if valid_len > 0 {
+                let candidate =
+                    std::str::from_utf8(&self.bytes[..valid_len]).expect("valid prefix");
+                if let Some(delta) = candidate.strip_prefix(&self.text) {
+                    if !delta.is_empty() {
+                        self.text = candidate.to_string();
+                    }
+                } else if candidate != self.text {
+                    self.text = candidate.to_string();
+                    self.stop_searched_len = 0;
+                }
+            }
+            let stop_found = stop_in_new_text(
+                &self.text,
+                self.stop_searched_len,
+                stop_values,
+                self.max_stop_bytes,
+            );
+            self.stop_searched_len = self.text.len();
+            if stop_found {
+                let end = trim_at_stop(&self.text, stop_values).len();
+                self.text.truncate(end);
+            }
+            stop_found
+        }
+
+        fn take_delta(&mut self, flush_all: bool) -> Option<String> {
+            let mut open = OpenText::new(self.max_stop_bytes);
+            open.text = self.text.clone();
+            open.streamed_text_len = self.streamed_text_len;
+            open.max_stop_bytes = self.max_stop_bytes;
+            match open.plan_emit(flush_all) {
+                EmitPlan::Delta { start, end } => {
+                    self.streamed_text_len = end;
+                    Some(self.text[start..end].to_string())
+                }
+                EmitPlan::Shrink(len) => {
+                    self.streamed_text_len = len;
+                    None
+                }
+                EmitPlan::Idle => None,
+            }
+        }
+    }
+
+    fn drive(pieces: &[&[u8]], stops: &[&str], max_stop_bytes: usize) -> (String, Vec<String>) {
+        let mut open = OpenText::new(max_stop_bytes);
+        let mut reference = Reference::new(max_stop_bytes);
+        let mut emitted = Vec::new();
+        for piece in pieces {
+            let stopped = open.push_piece(piece, stops);
+            let reference_stopped = reference.push_piece(piece, stops);
+            assert_eq!(stopped, reference_stopped);
+            assert_eq!(open.text(), reference.text);
+            assert_eq!(open.stop_searched_len, reference.stop_searched_len);
+            let delta = take_delta(&mut open, stopped);
+            assert_eq!(delta, reference.take_delta(stopped));
+            if let Some(delta) = delta {
+                emitted.push(delta);
+            }
+            if stopped {
+                break;
+            }
+        }
+        if !pieces.is_empty() {
+            let delta = take_delta(&mut open, true);
+            assert_eq!(delta, reference.take_delta(true));
+            if let Some(delta) = delta {
+                emitted.push(delta);
+            }
+        }
+        (open.text().to_string(), emitted)
+    }
+
+    fn take_delta(open: &mut OpenText, flush_all: bool) -> Option<String> {
+        match open.plan_emit(flush_all) {
+            EmitPlan::Delta { start, end } => {
+                let delta = open.text()[start..end].to_string();
+                open.commit_streamed(end);
+                Some(delta)
+            }
+            EmitPlan::Shrink(len) => {
+                open.commit_streamed(len);
+                None
+            }
+            EmitPlan::Idle => None,
+        }
+    }
+
+    #[test]
+    fn multibyte_utf8_split_across_tokens_matches_the_full_prefix() {
+        let euro = "€".as_bytes();
+        let emoji = "😀".as_bytes();
+        let mut pieces = Vec::new();
+        for byte in euro.iter().chain(emoji).copied() {
+            pieces.push(vec![byte]);
+        }
+        let refs: Vec<&[u8]> = pieces.iter().map(Vec::as_slice).collect();
+        let (text, emitted) = drive(&refs, &[], 0);
+        assert_eq!(text, "€😀");
+        assert_eq!(emitted.concat(), "€😀");
+        assert_eq!(emitted, vec!["€".to_string(), "😀".to_string()]);
+    }
+
+    #[test]
+    fn invalid_utf8_does_not_decode_bytes_after_the_error() {
+        let (text, _) = drive(&[b"hi", &[0xff], b"there"], &[], 0);
+        assert_eq!(text, "hi");
+    }
+
+    #[test]
+    fn long_stream_examines_bytes_proportional_to_the_new_piece() {
+        let mut open = OpenText::new(0);
+        let tokens = 4_096;
+        for _ in 0..tokens {
+            open.push_piece(b"a", &[]);
+        }
+        assert_eq!(open.text().len(), tokens);
+        let examined = open.decoder.bytes_examined();
+        assert!(
+            examined <= tokens * 4,
+            "examined {examined} bytes for {tokens} new bytes"
+        );
+    }
+
+    #[test]
+    fn stop_that_spans_tokens_trims_and_flush_releases_the_holdback() {
+        let (text, emitted) = drive(&[b"hello ST", b"OP tail"], &["STOP"], "STOP".len());
+        assert_eq!(text, "hello ");
+        assert_eq!(emitted.concat(), "hello ");
+    }
+
+    #[test]
+    fn final_flush_keeps_an_incomplete_utf8_suffix_out_of_the_text() {
+        let (text, emitted) = drive(&[&[b'A', 0xE2, 0x82]], &[], 0);
+        assert_eq!(text, "A");
+        assert_eq!(emitted.concat(), "A");
+    }
+
+    #[test]
+    fn rewritten_text_resets_stop_search_before_the_next_check() {
+        let mut open = OpenText::new("hello".len());
+        open.push_piece(b"hello", &[]);
+        open.text = "zzzz".to_string();
+        open.synced_len = open.text.len();
+        open.stop_searched_len = 100;
+        let stopped = open.push_piece(b"!", &["hello"]);
+        assert!(stopped);
+        assert_eq!(open.text(), "");
+    }
+}
