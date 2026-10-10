@@ -11,7 +11,16 @@ fn limits(max_header_bytes: usize, max_chunked_wire_bytes: usize) -> HttpReadLim
 }
 
 fn header_of_len(total: usize) -> Vec<u8> {
-    let prefix = b"GET / HTTP/1.1\r\nX-Pad: ";
+    sized_header(b"GET / HTTP/1.1\r\nX-Pad: ", total)
+}
+
+/// `Connection` is dropped when the request is forwarded, so a pad here is over
+/// the read limit only if the completed-read check runs before that rebuild.
+fn connection_header_of_len(total: usize) -> Vec<u8> {
+    sized_header(b"GET / HTTP/1.1\r\nConnection: ", total)
+}
+
+fn sized_header(prefix: &[u8], total: usize) -> Vec<u8> {
     let suffix = b"\r\n\r\n";
     assert!(total > prefix.len() + suffix.len());
     let mut raw = prefix.to_vec();
@@ -67,6 +76,36 @@ async fn completed_headers_over_the_limit_are_rejected() {
     let mut split = header_of_len(180);
     let rest = split.split_off(60);
     expect_limit_error(vec![split, rest], limits(128, 1024), "HTTP headers exceed").await;
+}
+
+#[tokio::test]
+async fn stripped_header_over_the_completed_read_limit_is_rejected() {
+    let limit = 1024;
+    let over = connection_header_of_len(limit + 1);
+    expect_limit_error(vec![over], limits(limit, 1024), "HTTP headers exceed").await;
+
+    let mut split = connection_header_of_len(limit + 1);
+    let rest = split.split_off(400);
+    expect_limit_error(
+        vec![split, rest],
+        limits(limit, 1024),
+        "HTTP headers exceed",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn stripped_header_at_the_completed_read_limit_is_accepted() {
+    let limit = 1024;
+    let exact = connection_header_of_len(limit);
+    let accepted = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        read_parts(vec![exact], limits(limit, 1024)),
+    )
+    .await
+    .expect("boundary header")
+    .expect("header_end equal to the limit must be forwarded");
+    assert!(!accepted.raw.windows(8).any(|window| window == b"aaaaaaaa"));
 }
 
 #[tokio::test]
