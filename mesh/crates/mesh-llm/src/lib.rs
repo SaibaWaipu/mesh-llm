@@ -343,7 +343,7 @@ fn parse_failure_family(
             }
             "wallet" => Some(CliCommandFamily::Wallet),
             "config" => Some(CliCommandFamily::Configuration),
-            "doctor" => Some(CliCommandFamily::Diagnostics),
+            "doctor" | "jimoto" => Some(CliCommandFamily::Diagnostics),
             "discover" => Some(CliCommandFamily::Discovery),
             "rotate-key" | "auth" => Some(CliCommandFamily::Identity),
             "goose" | "claude" | "pi" | "opencode" => Some(CliCommandFamily::Agent),
@@ -837,6 +837,25 @@ mod cli_entrypoint_tests {
                 None,
             ),
             CliCommandFamily::Unknown
+        );
+    }
+
+    #[test]
+    fn parse_failure_family_matches_jimoto_command_family() {
+        use mesh_llm_events::CliCommandFamily;
+
+        // `command_family` files `Command::Jimoto` under Diagnostics; a parse
+        // failure on the same subcommand must not fall back to Unknown.
+        assert_eq!(
+            super::parse_failure_family(
+                &[
+                    OsString::from("mesh-llm"),
+                    OsString::from("jimoto"),
+                    OsString::from("--bad-flag")
+                ],
+                None,
+            ),
+            CliCommandFamily::Diagnostics
         );
     }
 
