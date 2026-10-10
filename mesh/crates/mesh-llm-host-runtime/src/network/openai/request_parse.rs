@@ -16,8 +16,10 @@ use audio_multipart::multipart_model_field;
 mod body_rewrite;
 mod chunked;
 mod effective_entity;
+mod framing;
 pub use body_rewrite::{inject_skippy_hooks_flag, rewrite_model_field};
 use chunked::{ChunkedDecoder, try_decode_chunked_body};
+use framing::{append_request_framing, request_framing};
 
 pub(crate) const MAX_HEADER_BYTES: usize = 64 * 1024;
 /// Private lifecycle ownership assertion used only on trusted mesh forwarding.
@@ -700,6 +702,7 @@ fn finalize_forwarded_request(
     let method = req.method.unwrap_or("GET");
     let path = rewritten_path.unwrap_or_else(|| req.path.unwrap_or("/"));
     let version = req.version.unwrap_or(1);
+    let framing = request_framing(req.headers)?;
 
     // Resolve the capsule client nonce once here, at the single point every
     // forwarded request is rebuilt — so local, remote, plugin-endpoint, and
@@ -736,9 +739,8 @@ fn finalize_forwarded_request(
         if strip_expect && name.eq_ignore_ascii_case("expect") {
             continue;
         }
-        if rewritten_body.is_some()
-            && (name.eq_ignore_ascii_case("content-length")
-                || name.eq_ignore_ascii_case("transfer-encoding"))
+        if name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
         {
             continue;
         }
@@ -747,6 +749,8 @@ fn finalize_forwarded_request(
     }
     if let Some(body) = rewritten_body {
         rebuilt.push_str(&format!("Content-Length: {}\r\n", body.len()));
+    } else {
+        append_request_framing(&mut rebuilt, framing);
     }
     rebuilt.push_str(&format!("x-request-id: {}\r\n", request_id.as_uuid()));
     rebuilt.push_str(&format!(
@@ -789,27 +793,13 @@ where
                 let method = req.method.unwrap_or("GET").to_string();
                 let path = req.path.unwrap_or("/").to_string();
 
-                let mut content_length = None;
-                let mut is_chunked = false;
+                let (content_length, is_chunked) = request_framing(req.headers)?.into_parts();
                 let mut expects_continue = false;
                 let mut correlation_id = None;
                 let mut content_type = None;
 
                 for header in req.headers.iter() {
-                    if header.name.eq_ignore_ascii_case("content-length") {
-                        let val = std::str::from_utf8(header.value)
-                            .context("invalid Content-Length encoding")?;
-                        content_length = Some(
-                            val.trim()
-                                .parse::<usize>()
-                                .with_context(|| format!("invalid Content-Length: {val}"))?,
-                        );
-                    } else if header.name.eq_ignore_ascii_case("transfer-encoding") {
-                        let val = std::str::from_utf8(header.value).unwrap_or("");
-                        is_chunked = val
-                            .split(',')
-                            .any(|part| part.trim().eq_ignore_ascii_case("chunked"));
-                    } else if header.name.eq_ignore_ascii_case("expect") {
+                    if header.name.eq_ignore_ascii_case("expect") {
                         let val = std::str::from_utf8(header.value).unwrap_or("");
                         expects_continue = val
                             .split(',')
@@ -830,12 +820,6 @@ where
                         correlation_id =
                             Some(std::str::from_utf8(header.value).unwrap_or("").to_string());
                     }
-                }
-
-                // RFC 7230 §3.3.3: if both Transfer-Encoding and Content-Length
-                // are present, Transfer-Encoding wins and Content-Length is ignored.
-                if is_chunked {
-                    content_length = None;
                 }
 
                 return Ok(ParsedHeaders {
