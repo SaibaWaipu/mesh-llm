@@ -4,23 +4,35 @@ use std::io;
 use std::path::Path;
 
 fn format_load_error(path: &Path, error: &libloading::Error) -> String {
-    let os_error = error
-        .source()
-        .and_then(|source| source.downcast_ref::<io::Error>());
-    match os_error {
+    let detail = match error.source() {
+        Some(source) => describe_source(source),
+        None => format!("OS error {}", source_less_os_error_label(error)),
+    };
+    format!(
+        "failed to load native runtime library {}: {} ({detail})",
+        path.display(),
+        error,
+    )
+}
+
+/// Render the OS-level detail carried by a `libloading::Error`'s source.
+///
+/// libloading 0.9 moved its platform error types into a private module, so the
+/// concrete `WindowsError`/`DlError` is no longer reachable from other crates and
+/// does not downcast to [`io::Error`]. Its `Display` still carries the code
+/// though: on Windows `WindowsError` delegates to
+/// [`io::Error::from_raw_os_error`] and renders as e.g.
+/// `The specified module could not be found. (os error 126)`, which is what makes
+/// a failed `LoadLibraryExW` — for instance an architecture mismatch between a
+/// native runtime DLL and the process — diagnosable.
+fn describe_source(source: &(dyn Error + 'static)) -> String {
+    match source.downcast_ref::<io::Error>() {
         Some(os_error) => format!(
-            "failed to load native runtime library {}: {} (OS error {}: {})",
-            path.display(),
-            error,
+            "OS error {}: {}",
             os_error.raw_os_error().unwrap_or(0),
             os_error,
         ),
-        None => format!(
-            "failed to load native runtime library {}: {} (OS error {})",
-            path.display(),
-            error,
-            source_less_os_error_label(error),
-        ),
+        None => format!("OS error: {source}"),
     }
 }
 
@@ -105,6 +117,28 @@ mod tests {
 
         assert!(message.contains("OS error unavailable"));
         assert!(!message.contains("OS error 0"));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn load_error_reports_windows_os_error_detail() {
+        // libloading 0.9 no longer exposes its `WindowsError` type, but the
+        // source's `Display` still carries the code. A missing DLL fails
+        // LoadLibraryExW with ERROR_MOD_NOT_FOUND (126); regressing to
+        // `OS error unavailable` here is what makes a failed native-runtime load
+        // impossible to diagnose.
+        let path = Path::new("mesh-llm-missing-native-runtime.dll");
+        let message =
+            unsafe { super::load(path) }.expect_err("unexpectedly loaded missing test library");
+
+        assert!(
+            message.contains("os error"),
+            "missing Windows OS error detail in: {message}"
+        );
+        assert!(
+            !message.contains("OS error unavailable"),
+            "Windows load failure lost its OS error detail: {message}"
+        );
     }
 
     #[cfg(target_os = "windows")]
