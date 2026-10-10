@@ -1286,8 +1286,12 @@ pub(crate) mod tests {
 
     #[cfg(windows)]
     fn sleeping_test_command() -> Command {
-        let mut command = Command::new("cmd");
-        command.args(["/C", "ping -n 61 127.0.0.1 >NUL"]);
+        // Spawn `ping` itself for the same reason: killing a `cmd /C` wrapper
+        // would leave the ping process running.
+        let mut command = Command::new("ping");
+        command
+            .args(["-n", "61", "127.0.0.1"])
+            .stdout(std::process::Stdio::null());
         command
     }
 
