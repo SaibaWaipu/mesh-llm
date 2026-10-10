@@ -268,7 +268,7 @@ mesh-llm serve --gguf "/mnt/d/models/model.gguf" --listen-all --auto
 
 ## CI 基盤
 
-上流にならい、信頼済み `main` の Linux ジョブは Depot のマネージドランナーを使えます（リポジトリのランナー方針経由）。PR はキャッシュ隔離と保護ワークフローゲートが通るまで GitHub ホステッドのままです。詳しくは [`ci/DEPOT_MIGRATION.md`](ci/DEPOT_MIGRATION.md) です。
+本フォークでは GitHub Actions が現在動作していません（詳細は [JIMOTO.md](JIMOTO.md#リリースについて) を参照してください）。以下は上流の CI 構成です。上流では、リポジトリのランナー方針に基づき、信頼済み `main` の Linux ジョブで Depot のマネージドランナーを利用できます。PR はキャッシュ隔離と保護ワークフローゲートを通過するまで GitHub ホステッドのまま実行されます。詳細は [`ci/DEPOT_MIGRATION.md`](ci/DEPOT_MIGRATION.md) を参照してください。
 
 ## コミュニティ
 
