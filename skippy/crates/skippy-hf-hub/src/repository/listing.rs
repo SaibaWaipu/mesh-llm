@@ -140,6 +140,13 @@ impl<T: RepoType> HFRepository<T> {
     ///
     /// Endpoint: `HEAD {endpoint}/{prefix}{repo_id}/resolve/{revision}/{filepath}`.
     ///
+    /// The request deliberately does *not* follow the Hub's redirect to the CDN: the
+    /// `302` served by `/resolve/` carries the `X-Repo-Commit`, `ETag`, and
+    /// `X-Linked-Size` headers this method reads, but the CDN's `200` response on the
+    /// other side of the redirect does not, so a redirect-following client loses them
+    /// (manifesting as `missing X-Repo-Commit header`). This mirrors the HEAD probes in
+    /// [`super::download`] and [`crate::buckets`].
+    ///
     /// # Parameters
     ///
     /// - `filepath` (required): path of the file to inspect within the repository.
@@ -164,9 +171,13 @@ impl<T: RepoType> HFRepository<T> {
         )?;
 
         let headers = self.hf_client.auth_headers();
+        // Use the no-redirect client: the resolve endpoint's 302 carries the
+        // metadata headers (X-Repo-Commit, ETag, X-Linked-Size), but the CDN's
+        // 200 on the far side of the redirect does not, so following it would
+        // drop exactly the headers this method needs.
         let response = retry::retry(self.hf_client.retry_config(), || {
             self.hf_client
-                .http_client()
+                .no_redirect_client()
                 .head(&url)
                 .headers(headers.clone())
                 .send()
