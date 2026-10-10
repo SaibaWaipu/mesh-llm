@@ -70,13 +70,41 @@ def _cstring(data: bytes, offset: int) -> str:
     return data[offset:end].decode("ascii")
 
 
-def imported_dlls(path: pathlib.Path) -> list[str]:
-    data = path.read_bytes()
+# PE COFF `Machine` values for every architecture native runtimes ship for.
+MACHINE_I386 = 0x014C
+MACHINE_AMD64 = 0x8664
+MACHINE_ARM64 = 0xAA64
+
+MACHINE_NAMES = {
+    MACHINE_I386: "x86",
+    MACHINE_AMD64: "x86_64",
+    MACHINE_ARM64: "arm64",
+}
+
+
+def machine_name(machine: int) -> str:
+    return MACHINE_NAMES.get(machine, f"0x{machine:04x}")
+
+
+def _pe_offset(data: bytes, path: pathlib.Path) -> int:
     if data[:2] != b"MZ":
         raise PeFormatError(f"not a PE image: {path}")
-    (pe_offset,) = _unpack(data, "<I", 0x3C)
-    if data[pe_offset : pe_offset + 4] != b"PE\0\0":
+    (offset,) = _unpack(data, "<I", 0x3C)
+    if data[offset : offset + 4] != b"PE\0\0":
         raise PeFormatError(f"invalid PE signature: {path}")
+    return offset
+
+
+def pe_machine(path: pathlib.Path) -> int:
+    """Return the architecture recorded in a PE image's COFF file header."""
+    data = path.read_bytes()
+    (machine,) = _unpack(data, "<H", _pe_offset(data, path) + 4)
+    return machine
+
+
+def imported_dlls(path: pathlib.Path) -> list[str]:
+    data = path.read_bytes()
+    pe_offset = _pe_offset(data, path)
 
     file_header = pe_offset + 4
     (_, section_count, _, _, _, optional_size, _) = _unpack(
@@ -154,7 +182,16 @@ def default_search_dirs() -> list[pathlib.Path]:
     return candidates
 
 
-def _dll_index(directories: list[pathlib.Path]) -> dict[str, pathlib.Path]:
+def _matches_machine(path: pathlib.Path, expected_machine: int) -> bool:
+    try:
+        return pe_machine(path) == expected_machine
+    except (OSError, PeFormatError):
+        return False
+
+
+def _dll_index(
+    directories: list[pathlib.Path], expected_machine: int | None = None
+) -> dict[str, pathlib.Path]:
     result: dict[str, pathlib.Path] = {}
     for directory in directories:
         if not directory.is_dir():
@@ -164,8 +201,20 @@ def _dll_index(directories: list[pathlib.Path]) -> dict[str, pathlib.Path]:
         except OSError:
             continue
         for entry in entries:
-            if entry.is_file() and entry.suffix.casefold() == ".dll":
-                result.setdefault(entry.name.casefold(), entry)
+            if not (entry.is_file() and entry.suffix.casefold() == ".dll"):
+                continue
+            key = entry.name.casefold()
+            if key in result:
+                continue
+            # A same-named DLL for a different architecture can never satisfy the
+            # runtime's imports: LoadLibraryExW rejects it with ERROR_BAD_EXE_FORMAT.
+            # Skip it so the search keeps looking for a matching candidate instead
+            # of bundling a dependency the runtime cannot load at run time.
+            if expected_machine is not None and not _matches_machine(
+                entry, expected_machine
+            ):
+                continue
+            result[key] = entry
     return result
 
 
@@ -201,10 +250,30 @@ def dependency_gaps(
     return gaps
 
 
+def _runtime_machine(
+    lib_dir: pathlib.Path, scan_dirs: list[pathlib.Path]
+) -> int | None:
+    """Architecture of the runtime being packaged, read from its own DLLs."""
+    for directory in (lib_dir, *scan_dirs):
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.iterdir()):
+            if not (path.is_file() and path.suffix.casefold() == ".dll"):
+                continue
+            try:
+                return pe_machine(path)
+            except (OSError, PeFormatError):
+                continue
+    return None
+
+
 def collect_dependencies(
     lib_dir: pathlib.Path, search_dirs: list[pathlib.Path], scan_dirs: list[pathlib.Path] | None = None
 ) -> list[pathlib.Path]:
-    search_index = _dll_index([lib_dir, *search_dirs, *default_search_dirs()])
+    expected_machine = _runtime_machine(lib_dir, scan_dirs or [])
+    search_index = _dll_index(
+        [lib_dir, *search_dirs, *default_search_dirs()], expected_machine
+    )
     copied: list[pathlib.Path] = []
     while True:
         gaps = dependency_gaps(lib_dir, scan_dirs)
@@ -229,7 +298,32 @@ def collect_dependencies(
             raise RuntimeError(f"unresolved Windows runtime DLL dependencies: {details}")
 
 
+def runtime_architectures(lib_dir: pathlib.Path) -> dict[int, list[str]]:
+    machines: dict[int, list[str]] = {}
+    for path in sorted(lib_dir.iterdir()):
+        if not (path.is_file() and path.suffix.casefold() == ".dll"):
+            continue
+        try:
+            machine = pe_machine(path)
+        except (OSError, PeFormatError):
+            continue
+        machines.setdefault(machine, []).append(path.name)
+    return machines
+
+
+def verify_architectures(lib_dir: pathlib.Path) -> None:
+    machines = runtime_architectures(lib_dir)
+    if len(machines) <= 1:
+        return
+    details = "; ".join(
+        f"{machine_name(machine)}: {', '.join(sorted(names))}"
+        for machine, names in sorted(machines.items())
+    )
+    raise RuntimeError(f"mixed-architecture Windows runtime DLLs: {details}")
+
+
 def verify_dependencies(lib_dir: pathlib.Path, scan_dirs: list[pathlib.Path] | None = None) -> None:
+    verify_architectures(lib_dir)
     gaps = dependency_gaps(lib_dir, scan_dirs)
     if not gaps:
         return
