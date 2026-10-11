@@ -139,6 +139,61 @@ class WindowsNativeRuntimeDepsTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "cudart64_12.dll"):
                 DEPS.verify_dependencies(lib_dir)
 
+    def test_pe_machine_reads_only_the_header_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = pathlib.Path(directory) / "huge.dll"
+            write_pe(library, ["KERNEL32.dll"])
+            with library.open("ab") as handle:
+                handle.truncate(8 * 1024 * 1024)
+
+            with mock.patch.object(
+                pathlib.Path,
+                "read_bytes",
+                side_effect=AssertionError("pe_machine read the whole file"),
+            ):
+                self.assertEqual(DEPS.pe_machine(library), DEPS.MACHINE_AMD64)
+
+    def test_runtime_machine_prefers_llama_over_an_earlier_wrong_dll(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            lib_dir = root / "lib"
+            x86_dir = root / "x86"
+            x64_dir = root / "x64"
+            lib_dir.mkdir()
+            x86_dir.mkdir()
+            x64_dir.mkdir()
+            write_pe(lib_dir / "aaa.dll", [], machine=DEPS.MACHINE_I386)
+            write_pe(lib_dir / "bbb.dll", [], machine=DEPS.MACHINE_I386)
+            write_pe(lib_dir / "ccc.dll", [], machine=DEPS.MACHINE_I386)
+            write_pe(lib_dir / "llama.dll", ["vcomp140.dll"])
+            write_pe(
+                x86_dir / "vcomp140.dll", ["KERNEL32.dll"], machine=DEPS.MACHINE_I386
+            )
+            write_pe(x64_dir / "vcomp140.dll", ["KERNEL32.dll"])
+
+            self.assertEqual(
+                DEPS._runtime_machine(lib_dir, []), DEPS.MACHINE_AMD64
+            )
+            with mock.patch.object(DEPS, "default_search_dirs", return_value=[]):
+                copied = DEPS.collect_dependencies(lib_dir, [x86_dir, x64_dir])
+
+            self.assertEqual(
+                (lib_dir / "vcomp140.dll").read_bytes(),
+                (x64_dir / "vcomp140.dll").read_bytes(),
+            )
+            self.assertEqual([path.name for path in copied], ["vcomp140.dll"])
+
+    def test_runtime_machine_uses_majority_without_a_core_dll(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lib_dir = pathlib.Path(directory)
+            write_pe(lib_dir / "a.dll", [])
+            write_pe(lib_dir / "b.dll", [])
+            write_pe(lib_dir / "c.dll", [], machine=DEPS.MACHINE_I386)
+
+            self.assertEqual(
+                DEPS._runtime_machine(lib_dir, []), DEPS.MACHINE_AMD64
+            )
+
     def test_reads_pe_machine(self):
         with tempfile.TemporaryDirectory() as directory:
             library = pathlib.Path(directory) / "llama.dll"

@@ -95,9 +95,15 @@ def _pe_offset(data: bytes, path: pathlib.Path) -> int:
     return offset
 
 
+# Enough for the DOS stub and the COFF `Machine` field. Real images keep
+# `e_lfanew` well inside this window, so a PATH scan does not read each DLL.
+_PE_MACHINE_PREFIX = 4096
+
+
 def pe_machine(path: pathlib.Path) -> int:
     """Return the architecture recorded in a PE image's COFF file header."""
-    data = path.read_bytes()
+    with path.open("rb") as handle:
+        data = handle.read(_PE_MACHINE_PREFIX)
     (machine,) = _unpack(data, "<H", _pe_offset(data, path) + 4)
     return machine
 
@@ -250,21 +256,55 @@ def dependency_gaps(
     return gaps
 
 
+def _is_runtime_core(name: str) -> bool:
+    normalized = name.casefold()
+    return normalized.startswith(("llama", "ggml"))
+
+
+def _majority_machine(machines: list[int]) -> int | None:
+    if not machines:
+        return None
+    counts: dict[int, int] = {}
+    selected = machines[0]
+    selected_count = 0
+    for machine in machines:
+        counts[machine] = counts.get(machine, 0) + 1
+        if counts[machine] > selected_count:
+            selected = machine
+            selected_count = counts[machine]
+    return selected
+
+
 def _runtime_machine(
     lib_dir: pathlib.Path, scan_dirs: list[pathlib.Path]
 ) -> int | None:
-    """Architecture of the runtime being packaged, read from its own DLLs."""
+    """Architecture of the runtime being packaged.
+
+    llama/ggml DLLs decide when any are present, so a stray DLL that sorts
+    first cannot pick a different architecture. Otherwise the majority of the
+    readable DLLs wins.
+    """
+    core: list[int] = []
+    others: list[int] = []
     for directory in (lib_dir, *scan_dirs):
         if not directory.is_dir():
             continue
-        for path in sorted(directory.iterdir()):
+        try:
+            entries = list(directory.iterdir())
+        except OSError:
+            continue
+        for path in entries:
             if not (path.is_file() and path.suffix.casefold() == ".dll"):
                 continue
             try:
-                return pe_machine(path)
+                machine = pe_machine(path)
             except (OSError, PeFormatError):
                 continue
-    return None
+            if _is_runtime_core(path.name):
+                core.append(machine)
+            else:
+                others.append(machine)
+    return _majority_machine(core or others)
 
 
 def collect_dependencies(
