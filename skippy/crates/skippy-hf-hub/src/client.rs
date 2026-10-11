@@ -75,10 +75,24 @@ pub fn split_id(id: &str) -> (&str, &str) {
 /// Whether a `Location` header value is a relative reference (no scheme, no
 /// host), like `/Snowflake/repo/resolve/main/config.json`. Protocol-relative
 /// URLs (`//host/path`) carry a host and are treated as absolute.
-#[cfg(test)]
 fn is_relative_location(location: &str) -> bool {
     Url::parse(location) == Err(url::ParseError::RelativeUrlWithoutBase)
         && !location.starts_with("//")
+}
+
+/// Whether following `location` from `current` stays on the same hub.
+///
+/// A relative reference has no host of its own, so it stays. An absolute URL
+/// stays only when the scheme, host, and port match. A CDN redirect does not.
+pub(crate) fn location_stays_on_hub(current: &Url, location: &str) -> bool {
+    if is_relative_location(location) {
+        return true;
+    }
+    Url::parse(location).is_ok_and(|target| {
+        target.scheme() == current.scheme()
+            && target.host() == current.host()
+            && target.port_or_known_default() == current.port_or_known_default()
+    })
 }
 
 /// Async client for the Hugging Face Hub API.
@@ -587,7 +601,8 @@ mod tests {
     use url::Url;
 
     use super::{
-        HFClientBuilder, append_path_segments, encode_ref, is_relative_location, split_id,
+        HFClientBuilder, append_path_segments, encode_ref, is_relative_location,
+        location_stays_on_hub, split_id,
     };
 
     #[test]
@@ -669,6 +684,27 @@ mod tests {
             "https://cdn-lfs.huggingface.co/repos/x"
         ));
         assert!(!is_relative_location("//cdn-lfs.huggingface.co/repos/x"));
+    }
+
+    #[test]
+    fn location_stays_on_hub_follows_relative_and_same_host_only() {
+        let current = Url::parse("https://huggingface.co/owner/repo/resolve/main/file").unwrap();
+        assert!(location_stays_on_hub(
+            &current,
+            "/api/resolve-cache/models/owner/repo/file"
+        ));
+        assert!(location_stays_on_hub(
+            &current,
+            "https://huggingface.co/api/resolve-cache/models/owner/repo/file"
+        ));
+        assert!(!location_stays_on_hub(
+            &current,
+            "https://cdn-lfs.huggingface.co/repos/x"
+        ));
+        assert!(!location_stays_on_hub(
+            &current,
+            "//cdn-lfs.huggingface.co/repos/x"
+        ));
     }
 
     #[test]

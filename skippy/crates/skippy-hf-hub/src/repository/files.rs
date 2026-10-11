@@ -84,8 +84,9 @@ pub struct FileMetadataInfo {
     /// File size in bytes. Falls back to `0` if neither `X-Linked-Size` nor `Content-Length`
     /// is present on the response.
     pub file_size: u64,
-    /// Final URL the HEAD request resolved to after redirects (Hub URL or CDN). `None` when no
-    /// redirect was followed and the request URL itself was not preserved.
+    /// URL of the file content. A cross-host redirect records its `Location` header
+    /// without requesting that host. A same-hub redirect, or a direct `200`, records
+    /// the final request URL. `None` when a redirect has no `Location` header.
     pub location: Option<String>,
 }
 

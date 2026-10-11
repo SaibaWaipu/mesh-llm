@@ -9,11 +9,13 @@ changes. The import uses workspace versioning; the upstream source version
 remains 1.0.2 in that provenance record.
 
 Production changes beyond rustfmt are limited to boxing four inner download
-futures before awaiting them and removing an uncalled private HEAD helper.
-The public finishers remain async methods; their future representation and
-allocation change. This restores the retained future-size tests, which also
-failed against the unchanged pinned source on this toolchain. The relative
-location predicate remains test-only with its classification test.
+futures before awaiting them, removing an uncalled private HEAD helper, and
+teaching file-metadata lookup to follow same-hub redirects while reading
+cross-host redirect headers in place. The public finishers remain async
+methods; their future representation and allocation change. This restores the
+retained future-size tests, which also failed against the unchanged pinned
+source on this toolchain. The relative-location predicate now decides which
+metadata redirects stay on the hub.
 
 Token-precedence tests use
 child-process environments instead of mutating the parent test environment;

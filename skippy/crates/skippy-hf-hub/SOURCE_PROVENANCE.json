@@ -33,7 +33,9 @@
   "local_deltas": [
     "rustfmt --edition 2024 over all Rust sources and tests",
     "src/client.rs: preserve eight token-precedence scenarios in subprocess environments with a filtered child assertion worker",
-    "src/client.rs: remove uncalled private head_with_relative_redirects; retain is_relative_location and its classification test under cfg(test)",
+    "src/client.rs: remove uncalled private head_with_relative_redirects; keep the relative-location predicate and use it so metadata lookups follow same-hub redirects only",
+    "src/repository/files.rs: document that file-metadata location is the unfollowed Location header or the final same-hub URL",
+    "src/repository/listing.rs: follow same-hub metadata redirects and read cross-host redirect headers, including Location, without requesting the CDN",
     "src/repository/download.rs: box the four inner download implementation futures before awaiting them inside existing public async finishers; signatures remain async, while future representation and allocation change; original 2048/4096-byte limits retained"
   ],
   "imported_sha256": {
@@ -42,7 +44,7 @@
     "src/buckets/sync.rs": "8feefbfaa9a43c98be87dd1b30cd8c0fffea66d8b010e93cd2ac210c5dd5e4c0",
     "src/cache/mod.rs": "fb7e12426dbc5aada673e3fd297248010e5ac98f645109d365a25dc3a25396f0",
     "src/cache/storage.rs": "6848eb6cf13b836d582f1797c60be98c2723492b59ed327a7356579ddb0c8dd4",
-    "src/client.rs": "6567e1d850d291480a2793cc7cbf8e6a773e6f28e471339b4b869907b675538e",
+    "src/client.rs": "a061af35a1f2ee530745e0b6d496819a0d576321bcf1d3c630382f56be1051d6",
     "src/constants.rs": "ab742819b90a62c3e1fdb63d98bf12b4f38b3fc440e29fa80dfe13cb2a869417",
     "src/error.rs": "4b3aeb8a9f3eaed8e0a6d7bf16f470acaf11d38f3b587966baaa006e7017a0b6",
     "src/lib.rs": "bf6bbc049c84fb0c183db4d295837513763b0c295e821f0faee6be836c01d89b",
@@ -51,8 +53,8 @@
     "src/repository/commits.rs": "a9beb194ee45b30636844de7a85cf0fc5fe83698c1c77202da2fb33a2912f3a5",
     "src/repository/diff.rs": "d75a0064385b96d36c678aff8aa65909b58634a5c3336de8f96490561fa40ac5",
     "src/repository/download.rs": "1289dd4617039ed3b04e985159c36ad2f1edaa868d5bc4e998ddc86b38c04209",
-    "src/repository/files.rs": "80eb8d67d577bf32eab83544eca49cdca391eab808c769dce5c15b4bf9c22b1d",
-    "src/repository/listing.rs": "d829e36e498066ee5815dbf5f4a6a98f41b647f6a40ea14d91a1e591c17cf318",
+    "src/repository/files.rs": "cf4aad64895d494be884154a7ceba6532d7b70da69d8f804dc7b9aadb3b7e33a",
+    "src/repository/listing.rs": "4df265e2c7b80b37fa1fd827d53aa7ae43862aeb50b1f76a412819255141f905",
     "src/repository/mod.rs": "b479c9fcf8c6547f31e27369f04b103faff8bb77176cca3027e1836c41ce2941",
     "src/repository/repo_type.rs": "edf5e6da044ffc565db8afd5a8ce07c8116bc394d897702b8a8173a52d079f66",
     "src/repository/upload.rs": "b8cfacd31e6cacbc59aff2946a84bfc19af63ec330996af6be9cfa1c96b244b6",
