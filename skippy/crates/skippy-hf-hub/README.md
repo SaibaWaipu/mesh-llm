@@ -10,8 +10,9 @@ remains 1.0.2 in that provenance record.
 
 Production changes beyond rustfmt are limited to boxing four inner download
 futures before awaiting them, removing an uncalled private HEAD helper, and
-teaching file-metadata lookup to follow same-hub redirects while reading
-cross-host redirect headers in place. The public finishers remain async
+teaching file-metadata lookup to follow same-hub redirects, read
+cross-host redirect headers in place, and reject a redirect that has no
+usable Location. The public finishers remain async
 methods; their future representation and allocation change. This restores the
 retained future-size tests, which also failed against the unchanged pinned
 source on this toolchain. The relative-location predicate now decides which

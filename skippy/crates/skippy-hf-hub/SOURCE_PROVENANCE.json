@@ -35,7 +35,7 @@
     "src/client.rs: preserve eight token-precedence scenarios in subprocess environments with a filtered child assertion worker",
     "src/client.rs: remove uncalled private head_with_relative_redirects; keep the relative-location predicate and use it so metadata lookups follow same-hub redirects only",
     "src/repository/files.rs: document that file-metadata location is the unfollowed Location header or the final same-hub URL",
-    "src/repository/listing.rs: follow same-hub metadata redirects and read cross-host redirect headers, including Location, without requesting the CDN",
+    "src/repository/listing.rs: follow same-hub metadata redirects, keep cross-host Location headers without requesting the CDN, and reject a 3xx that has no usable Location",
     "src/repository/download.rs: box the four inner download implementation futures before awaiting them inside existing public async finishers; signatures remain async, while future representation and allocation change; original 2048/4096-byte limits retained"
   ],
   "imported_sha256": {
@@ -54,7 +54,7 @@
     "src/repository/diff.rs": "d75a0064385b96d36c678aff8aa65909b58634a5c3336de8f96490561fa40ac5",
     "src/repository/download.rs": "1289dd4617039ed3b04e985159c36ad2f1edaa868d5bc4e998ddc86b38c04209",
     "src/repository/files.rs": "cf4aad64895d494be884154a7ceba6532d7b70da69d8f804dc7b9aadb3b7e33a",
-    "src/repository/listing.rs": "4df265e2c7b80b37fa1fd827d53aa7ae43862aeb50b1f76a412819255141f905",
+    "src/repository/listing.rs": "7027eaba101961f608aff756fab9fd36e301b129e62719cd09997a1b67c01280",
     "src/repository/mod.rs": "b479c9fcf8c6547f31e27369f04b103faff8bb77176cca3027e1836c41ce2941",
     "src/repository/repo_type.rs": "edf5e6da044ffc565db8afd5a8ce07c8116bc394d897702b8a8173a52d079f66",
     "src/repository/upload.rs": "b8cfacd31e6cacbc59aff2946a84bfc19af63ec330996af6be9cfa1c96b244b6",
