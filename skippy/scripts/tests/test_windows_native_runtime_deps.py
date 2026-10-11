@@ -30,12 +30,12 @@ def bash_executable() -> str:
     raise RuntimeError("Git Bash is required for native-runtime verifier tests")
 
 
-def write_pe(path: pathlib.Path, imports: list[str]) -> None:
+def write_pe(path: pathlib.Path, imports: list[str], machine: int = 0x8664) -> None:
     data = bytearray(0x800)
     data[:2] = b"MZ"
     struct.pack_into("<I", data, 0x3C, 0x80)
     data[0x80:0x84] = b"PE\0\0"
-    struct.pack_into("<HHIIIHH", data, 0x84, 0x8664, 1, 0, 0, 0, 0xF0, 0)
+    struct.pack_into("<HHIIIHH", data, 0x84, machine, 1, 0, 0, 0, 0xF0, 0)
     optional = 0x98
     struct.pack_into("<H", data, optional, 0x20B)
     struct.pack_into("<II", data, optional + 120, 0x1000, (len(imports) + 1) * 20)
@@ -137,6 +137,121 @@ class WindowsNativeRuntimeDepsTests(unittest.TestCase):
 
             write_pe(lib_dir / "ggml-cuda.dll", ["cudart64_12.dll"])
             with self.assertRaisesRegex(RuntimeError, "cudart64_12.dll"):
+                DEPS.verify_dependencies(lib_dir)
+
+    def test_pe_machine_reads_only_the_header_prefix(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = pathlib.Path(directory) / "huge.dll"
+            write_pe(library, ["KERNEL32.dll"])
+            with library.open("ab") as handle:
+                handle.truncate(8 * 1024 * 1024)
+
+            with mock.patch.object(
+                pathlib.Path,
+                "read_bytes",
+                side_effect=AssertionError("pe_machine read the whole file"),
+            ):
+                self.assertEqual(DEPS.pe_machine(library), DEPS.MACHINE_AMD64)
+
+    def test_runtime_machine_prefers_llama_over_an_earlier_wrong_dll(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            lib_dir = root / "lib"
+            x86_dir = root / "x86"
+            x64_dir = root / "x64"
+            lib_dir.mkdir()
+            x86_dir.mkdir()
+            x64_dir.mkdir()
+            write_pe(lib_dir / "aaa.dll", [], machine=DEPS.MACHINE_I386)
+            write_pe(lib_dir / "bbb.dll", [], machine=DEPS.MACHINE_I386)
+            write_pe(lib_dir / "ccc.dll", [], machine=DEPS.MACHINE_I386)
+            write_pe(lib_dir / "llama.dll", ["vcomp140.dll"])
+            write_pe(
+                x86_dir / "vcomp140.dll", ["KERNEL32.dll"], machine=DEPS.MACHINE_I386
+            )
+            write_pe(x64_dir / "vcomp140.dll", ["KERNEL32.dll"])
+
+            self.assertEqual(
+                DEPS._runtime_machine(lib_dir, []), DEPS.MACHINE_AMD64
+            )
+            with mock.patch.object(DEPS, "default_search_dirs", return_value=[]):
+                copied = DEPS.collect_dependencies(lib_dir, [x86_dir, x64_dir])
+
+            self.assertEqual(
+                (lib_dir / "vcomp140.dll").read_bytes(),
+                (x64_dir / "vcomp140.dll").read_bytes(),
+            )
+            self.assertEqual([path.name for path in copied], ["vcomp140.dll"])
+
+    def test_runtime_machine_uses_majority_without_a_core_dll(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lib_dir = pathlib.Path(directory)
+            write_pe(lib_dir / "a.dll", [])
+            write_pe(lib_dir / "b.dll", [])
+            write_pe(lib_dir / "c.dll", [], machine=DEPS.MACHINE_I386)
+
+            self.assertEqual(
+                DEPS._runtime_machine(lib_dir, []), DEPS.MACHINE_AMD64
+            )
+
+    def test_reads_pe_machine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            library = pathlib.Path(directory) / "llama.dll"
+            write_pe(library, ["KERNEL32.dll"])
+            self.assertEqual(DEPS.pe_machine(library), DEPS.MACHINE_AMD64)
+
+            write_pe(library, ["KERNEL32.dll"], machine=DEPS.MACHINE_I386)
+            self.assertEqual(DEPS.pe_machine(library), DEPS.MACHINE_I386)
+
+    def test_collect_skips_dependency_of_mismatched_architecture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            lib_dir = root / "artifact" / "lib"
+            compiler_dir = root / "mingw" / "bin"
+            lib_dir.mkdir(parents=True)
+            compiler_dir.mkdir(parents=True)
+            write_pe(lib_dir / "llama.dll", ["vcomp140.dll"])
+            write_pe(
+                compiler_dir / "vcomp140.dll",
+                ["KERNEL32.dll"],
+                machine=DEPS.MACHINE_I386,
+            )
+
+            with mock.patch.object(DEPS, "default_search_dirs", return_value=[]):
+                with self.assertRaisesRegex(RuntimeError, "vcomp140.dll"):
+                    DEPS.collect_dependencies(lib_dir, [compiler_dir])
+
+    def test_collect_prefers_dependency_of_matching_architecture(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            lib_dir = root / "artifact" / "lib"
+            x86_dir = root / "x86"
+            x64_dir = root / "x64"
+            lib_dir.mkdir(parents=True)
+            x86_dir.mkdir(parents=True)
+            x64_dir.mkdir(parents=True)
+            write_pe(lib_dir / "llama.dll", ["vcomp140.dll"])
+            write_pe(
+                x86_dir / "vcomp140.dll", ["KERNEL32.dll"], machine=DEPS.MACHINE_I386
+            )
+            write_pe(x64_dir / "vcomp140.dll", ["KERNEL32.dll"])
+
+            with mock.patch.object(DEPS, "default_search_dirs", return_value=[]):
+                copied = DEPS.collect_dependencies(lib_dir, [x86_dir, x64_dir])
+
+            self.assertEqual([path.name for path in copied], ["vcomp140.dll"])
+            self.assertEqual(
+                (lib_dir / "vcomp140.dll").read_bytes(),
+                (x64_dir / "vcomp140.dll").read_bytes(),
+            )
+
+    def test_verification_rejects_mixed_architecture_runtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lib_dir = pathlib.Path(directory)
+            write_pe(lib_dir / "llama.dll", [])
+            write_pe(lib_dir / "vcomp140.dll", [], machine=DEPS.MACHINE_I386)
+
+            with self.assertRaisesRegex(RuntimeError, "mixed-architecture"):
                 DEPS.verify_dependencies(lib_dir)
 
     def test_package_verifier_accepts_closed_windows_dependency_graph(self):

@@ -140,6 +140,14 @@ impl<T: RepoType> HFRepository<T> {
     ///
     /// Endpoint: `HEAD {endpoint}/{prefix}{repo_id}/resolve/{revision}/{filepath}`.
     ///
+    /// A redirect to another host, such as the CDN `302` from `/resolve/`, is not
+    /// followed: that response carries `X-Repo-Commit`, `ETag`, and `X-Linked-Size`,
+    /// while the CDN `200` does not. A relative or same-host redirect, such as the
+    /// `307` to `/api/resolve-cache/`, is followed so the final response can supply
+    /// the size. `location` is the `Location` header when the redirect is not
+    /// followed, and the final request URL otherwise. A `3xx` with no usable
+    /// `Location` is an error.
+    ///
     /// # Parameters
     ///
     /// - `filepath` (required): path of the file to inspect within the repository.
@@ -163,25 +171,7 @@ impl<T: RepoType> HFRepository<T> {
             &filename,
         )?;
 
-        let headers = self.hf_client.auth_headers();
-        let response = retry::retry(self.hf_client.retry_config(), || {
-            self.hf_client
-                .http_client()
-                .head(&url)
-                .headers(headers.clone())
-                .send()
-        })
-        .await?;
-        let response = self
-            .hf_client
-            .check_response(
-                response,
-                Some(&repo_path),
-                crate::error::NotFoundContext::Entry {
-                    path: filename.clone(),
-                },
-            )
-            .await?;
+        let response = head_file_metadata(self, &url, &filename).await?;
 
         let etag = extract_etag(&response).ok_or_else(|| {
             HFError::malformed_response_at(
@@ -203,7 +193,7 @@ impl<T: RepoType> HFRepository<T> {
             );
             0
         });
-        let location = Some(response.url().to_string());
+        let location = metadata_location(&response);
 
         Ok(FileMetadataInfo {
             filename,
@@ -214,6 +204,104 @@ impl<T: RepoType> HFRepository<T> {
             location,
         })
     }
+}
+
+const MAX_SAME_HUB_REDIRECTS: usize = 8;
+
+async fn head_file_metadata<T: RepoType>(
+    repo: &HFRepository<T>,
+    start: &str,
+    filename: &str,
+) -> HFResult<reqwest::Response> {
+    let mut current = Url::parse(start)?;
+    let headers = repo.hf_client.auth_headers();
+    let repo_path = repo.repo_path();
+    for _ in 0..MAX_SAME_HUB_REDIRECTS {
+        let response = retry::retry(repo.hf_client.retry_config(), || {
+            repo.hf_client
+                .no_redirect_client()
+                .head(current.clone())
+                .headers(headers.clone())
+                .send()
+        })
+        .await?;
+        if response.status().is_success() {
+            return Ok(response);
+        }
+        match classify_metadata_redirect(&current, &response) {
+            Some(MetadataRedirect::Follow(next)) => {
+                current = next;
+                continue;
+            }
+            Some(MetadataRedirect::Keep) => return Ok(response),
+            Some(MetadataRedirect::Unusable) => {
+                return Err(HFError::malformed_response_at(
+                    format!("redirect without Location for {filename}"),
+                    current.as_str(),
+                ));
+            }
+            None => {}
+        }
+        return repo
+            .hf_client
+            .check_response(
+                response,
+                Some(&repo_path),
+                crate::error::NotFoundContext::Entry {
+                    path: filename.to_string(),
+                },
+            )
+            .await;
+    }
+    Err(HFError::malformed_response_at(
+        format!("too many same-hub redirects for {filename}"),
+        start,
+    ))
+}
+
+enum MetadataRedirect {
+    Follow(Url),
+    Keep,
+    Unusable,
+}
+
+fn classify_metadata_redirect(
+    current: &Url,
+    response: &reqwest::Response,
+) -> Option<MetadataRedirect> {
+    if !response.status().is_redirection() {
+        return None;
+    }
+    let Some(location) = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|location| !location.is_empty())
+    else {
+        return Some(MetadataRedirect::Unusable);
+    };
+    if crate::client::location_stays_on_hub(current, location) {
+        return Some(match current.join(location) {
+            Ok(next) if next != *current => MetadataRedirect::Follow(next),
+            _ => MetadataRedirect::Unusable,
+        });
+    }
+    if current.join(location).is_ok() || Url::parse(location).is_ok() {
+        return Some(MetadataRedirect::Keep);
+    }
+    Some(MetadataRedirect::Unusable)
+}
+
+fn metadata_location(response: &reqwest::Response) -> Option<String> {
+    if response.status().is_redirection() {
+        return response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+    }
+    Some(response.url().to_string())
 }
 
 #[cfg(feature = "blocking")]
@@ -284,5 +372,227 @@ impl<T: RepoType> crate::blocking::HFRepositorySync<T> {
                 .maybe_revision(revision)
                 .send(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::{MetadataRedirect, classify_metadata_redirect};
+    use crate::HFClientBuilder;
+
+    const COMMIT: &str = "0123456789012345678901234567890123456789";
+
+    async fn serve(
+        listener: tokio::net::TcpListener,
+        response_for: impl Fn(&str) -> String + Send + Sync + 'static,
+    ) {
+        let response_for = Arc::new(response_for);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let response_for = Arc::clone(&response_for);
+                tokio::spawn(async move {
+                    let mut request = vec![0; 4096];
+                    let Ok(read) = socket.read(&mut request).await else {
+                        return;
+                    };
+                    let request = String::from_utf8_lossy(&request[..read]);
+                    let path = request.split_whitespace().nth(1).unwrap_or("");
+                    let response = response_for(path);
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+    }
+
+    async fn metadata_fixture() -> (String, Arc<AtomicUsize>) {
+        let cdn = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let cdn_addr = cdn.local_addr().unwrap();
+        let cdn_hits = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&cdn_hits);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = cdn.accept().await else {
+                    return;
+                };
+                hits.fetch_add(1, Ordering::Relaxed);
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let hub = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let hub_addr = hub.local_addr().unwrap();
+        let cdn_url = format!("http://{cdn_addr}/model.gguf");
+        serve(hub, move |path| {
+            if path.ends_with("/resolve/main/README.md") {
+                "HTTP/1.1 307 Temporary Redirect\r\n\
+                 Location: /api/resolve-cache/models/owner/repo/README.md\r\n\
+                 Content-Length: 0\r\n\
+                 Connection: close\r\n\
+                 \r\n"
+                    .to_string()
+            } else if path.contains("/resolve-cache/") {
+                format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     ETag: \"readme-etag\"\r\n\
+                     X-Repo-Commit: {COMMIT}\r\n\
+                     Content-Length: 7576\r\n\
+                     Connection: close\r\n\
+                     \r\n"
+                )
+            } else if path.ends_with("/resolve/main/model.gguf") {
+                format!(
+                    "HTTP/1.1 302 Found\r\n\
+                     Location: {cdn_url}\r\n\
+                     X-Linked-Etag: \"gguf-etag\"\r\n\
+                     X-Repo-Commit: {COMMIT}\r\n\
+                     X-Linked-Size: 99\r\n\
+                     Content-Length: 0\r\n\
+                     Connection: close\r\n\
+                     \r\n"
+                )
+            } else if path.ends_with("/resolve/main/plain.txt") {
+                format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     ETag: \"plain-etag\"\r\n\
+                     X-Repo-Commit: {COMMIT}\r\n\
+                     Content-Length: 4\r\n\
+                     Connection: close\r\n\
+                     \r\n"
+                )
+            } else {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string()
+            }
+        })
+        .await;
+        (format!("http://{hub_addr}"), cdn_hits)
+    }
+
+    #[tokio::test]
+    async fn file_metadata_reads_direct_ok_and_both_redirect_shapes() {
+        let (endpoint, cdn_hits) = metadata_fixture().await;
+        let client = HFClientBuilder::new()
+            .endpoint(endpoint.clone())
+            .retry_max_attempts(1)
+            .build()
+            .unwrap();
+        let repo = client.model("owner", "repo");
+
+        let plain = repo
+            .get_file_metadata()
+            .filepath("plain.txt")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(plain.commit_hash, COMMIT);
+        assert_eq!(plain.etag, "plain-etag");
+        assert_eq!(plain.file_size, 4);
+        assert_eq!(
+            plain.location.as_deref(),
+            Some(format!("{endpoint}/owner/repo/resolve/main/plain.txt").as_str())
+        );
+
+        let gguf = repo
+            .get_file_metadata()
+            .filepath("model.gguf")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(gguf.commit_hash, COMMIT);
+        assert_eq!(gguf.etag, "gguf-etag");
+        assert_eq!(gguf.file_size, 99);
+        assert!(
+            gguf.location
+                .as_deref()
+                .is_some_and(|location| location.ends_with("/model.gguf")),
+            "location should be the CDN target, got {:?}",
+            gguf.location
+        );
+        assert_eq!(cdn_hits.load(Ordering::Relaxed), 0);
+
+        let readme = repo
+            .get_file_metadata()
+            .filepath("README.md")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(readme.commit_hash, COMMIT);
+        assert_eq!(readme.etag, "readme-etag");
+        assert_eq!(readme.file_size, 7576);
+        assert_eq!(
+            readme.location.as_deref(),
+            Some(format!("{endpoint}/api/resolve-cache/models/owner/repo/README.md").as_str())
+        );
+    }
+
+    fn response_with(status: u16, headers: &[(&str, &str)]) -> reqwest::Response {
+        let mut builder = http::Response::builder().status(status);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        reqwest::Response::from(builder.body("").unwrap())
+    }
+
+    #[test]
+    fn redirect_without_a_usable_location_is_rejected() {
+        let current =
+            reqwest::Url::parse("https://huggingface.co/owner/repo/resolve/main/file").unwrap();
+        let missing = response_with(302, &[("etag", "\"abc\""), ("x-repo-commit", COMMIT)]);
+        assert!(matches!(
+            classify_metadata_redirect(&current, &missing),
+            Some(MetadataRedirect::Unusable)
+        ));
+        let blank = response_with(302, &[("location", " ")]);
+        assert!(matches!(
+            classify_metadata_redirect(&current, &blank),
+            Some(MetadataRedirect::Unusable)
+        ));
+        let broken = response_with(302, &[("location", "http://[")]);
+        assert!(matches!(
+            classify_metadata_redirect(&current, &broken),
+            Some(MetadataRedirect::Unusable)
+        ));
+    }
+
+    #[tokio::test]
+    async fn file_metadata_rejects_a_redirect_that_has_metadata_but_no_location() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        serve(listener, |_| {
+            format!(
+                "HTTP/1.1 302 Found\r\n\
+                 ETag: \"abc\"\r\n\
+                 X-Repo-Commit: {COMMIT}\r\n\
+                 X-Linked-Size: 10\r\n\
+                 Content-Length: 0\r\n\
+                 Connection: close\r\n\
+                 \r\n"
+            )
+        })
+        .await;
+        let client = HFClientBuilder::new()
+            .endpoint(format!("http://{addr}"))
+            .retry_max_attempts(1)
+            .build()
+            .unwrap();
+        let error = client
+            .model("owner", "repo")
+            .get_file_metadata()
+            .filepath("nolocation.bin")
+            .send()
+            .await
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("redirect without Location"), "{message}");
     }
 }
